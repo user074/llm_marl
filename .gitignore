@@ -1,3 +1,6 @@
+/wandb
+/model
+/Data
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -172,3 +175,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+debug_gloo.py
+nccl_test.py
+debug.py

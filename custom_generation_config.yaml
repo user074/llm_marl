@@ -1,0 +1,52 @@
+# Config for running the InferenceRecipe in generate.py to generate output
+# from Llama2 7B model
+#
+# This config assumes that you've run the following command before launching
+# this run:
+#   tune download meta-llama/Llama-2-7b-hf --output-dir /tmp/Llama-2-7b-hf --ignore-patterns "*.safetensors" --hf-token <HF_TOKEN>
+#
+# To launch, run the following command from root torchtune directory:
+#    tune run generate --config generation
+
+output_dir: ./ # Not needed
+
+# Model arguments
+model:
+  _component_: torchtune.models.llama3_2.llama3_2_3b
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /home/jqi/Github/llm_marl/model/checkpoints/grpo_llama3b/epoch_0/
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,
+    model-00002-of-00002.safetensors,
+  ]
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+device: cuda
+dtype: bf16
+
+seed: 1234
+
+# Tokenizer arguments
+tokenizer:
+  _component_: torchtune.models.llama3.llama3_tokenizer
+  path: /home/jqi/Github/llm_marl/model/checkpoints/grpo_llama3b/epoch_0/original/tokenizer.model
+  max_seq_len: null
+  prompt_template: null
+
+# Generation arguments; defaults taken from gpt-fast
+prompt:
+  system: "A conversation between User and Assistant. The user asks a question, and the Assistant solves it.
+    The assistant first thinks about the reasoning process in the mind and then provides the user with the answer.
+    The reasoning process and answer are enclosed within <think></think> and <answer></answer> tags, respectively,
+    i.e., <think>reasoning process here</think> <answer>answer here</answer>."
+  user: "Josh decides to try flipping a house. He buys a house for $80,000 and then puts in $50,000 in repairs. This increased the value of the house by 150%. How much profit did he make?"
+max_new_tokens: 300
+temperature: 0.6 # 0.8 and 0.6 are popular values to try
+top_k: 300
+
+enable_kv_cache: True
+
+quantizer: null
