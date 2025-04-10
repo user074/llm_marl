@@ -153,7 +153,7 @@ def shaped_correctness_reward_eval(answer: str, completion: str) -> tuple[float,
         if verification == "correct":
             eval_reward += 20.0
 
-    if len(tags["answer"]) > 0 and tags["answer"][-1] == answer:
+    if len(tags["answer"]) > 0 and tags["answer"][0] == answer:
         #Generator Correct Answer
         if verification == "correct":
             #Evaluator Correct Answer
@@ -166,7 +166,7 @@ def shaped_correctness_reward_eval(answer: str, completion: str) -> tuple[float,
             gen_success = 1.0
         success = 1
     
-    if len(tags["answer"]) > 0 and tags["answer"][-1] != answer:
+    if len(tags["answer"]) > 0 and tags["answer"][0] != answer:
         #Generator Incorrect Answer
         if verification == "correct":
             #Evaluator Correct Answer
