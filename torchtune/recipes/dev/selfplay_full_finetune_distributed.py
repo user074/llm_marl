@@ -138,9 +138,7 @@ class SelfplayFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
         self._epochs_run = 0
         self._rng = torch.Generator(self._device).manual_seed(self.seed)
         
-        self._evaluation_prefix = '''
-        The Assistant verify the problem and the solution. The assistant first evaluates about the solution process in the mind and then provides the verification. The evaluation process and verification are enclosed within <evaluate></evaluate> and <verify></verify> tags, respectively, i.e., <evaluate>evaluation process here</evaluate> <verify>verification here</verify>. Verification is limited to 'correct' or 'wrong'.
-        Assistant:<evaluate>'''
+        self._evaluation_prefix = '''The Assistant evaluate the problem and the solution. The assistant first evaluates and find out where the solution is wrong. Then the assistant provides the verification. The evaluation process and verification are enclosed within <evaluate></evaluate> and <verify></verify> tags, respectively, i.e., <evaluate>evaluation process here</evaluate> <verify>verification here</verify>. Verification is limited to 'correct' or 'wrong'. Assistant:<evaluate>'''
 
         # Elo rating attributes
         self.generator_rating = 1500.0  # Initial Elo rating for generator
@@ -905,7 +903,7 @@ class SelfplayFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
 
         # Extract responses from the GRPO group sample
         responses_generated = trajectory.query_responses # [B x G, L]
-        context_length = responses_generated.shape[1]
+        # context_length = responses_generated.shape[1]
 
         
         # Find the position of 128001 in each sequence
@@ -928,6 +926,7 @@ class SelfplayFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
         max_len = max(len(seq) for seq in concatenated_responses)
         padded_responses = [torch.nn.functional.pad(seq, (0, max_len - len(seq)), value=self._tokenizer.pad_id) for seq in concatenated_responses]
         responses_generated = torch.stack(padded_responses)
+        context_length = responses_generated.shape[1]
         
         # print("responses_generated after concat", responses_generated.shape)
         # print("decoded responses_generated", self._tokenizer.decode(responses_generated[0].tolist(), truncate_at_eos = False, skip_special_tokens = False))
@@ -953,7 +952,7 @@ class SelfplayFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
                 return_logits=False,
             )
         # print("query_responses shape", query_responses.shape)
-        # print("query_responses", self._tokenizer.decode(query_responses[0].tolist(), truncate_at_eos = False, skip_special_tokens = False))
+        # print("query_responses: ", self._tokenizer.decode(query_responses[0].tolist(), truncate_at_eos = False, skip_special_tokens = False))
 
         torch.distributed.barrier()
         training._distributed.recursive_reshard(self._model)
@@ -969,7 +968,7 @@ class SelfplayFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
         logits = self._model(query_responses, input_pos=position_ids, mask=masks)
         logits = logits[:, context_length - 1:]
         responses = query_responses[:, context_length:].clone()
-
+        # print("responses: ", self._tokenizer.decode(responses[0].tolist(), truncate_at_eos = False, skip_special_tokens = False))
         logprobs = rlhf.batched_logits_to_logprobs(logits, responses, self._temperature)
         del logits
         torch.cuda.empty_cache()
@@ -993,6 +992,7 @@ class SelfplayFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
         )
         
         #Need to contruct the reward_responses from the query_responses
+        # Reward is calculated from question, response, eval_prefix, evaluation
         reward_responses = query_responses[:, question_length:].clone()
         (
             reward_response_padding_masks,
@@ -1004,18 +1004,23 @@ class SelfplayFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
         # responses :: [B x G, L]
         # responses = responses.reshape(batch_size, grpo_samples, -1)  # [B, G, L]
         reward_responses = reward_responses.reshape(batch_size, grpo_samples, -1)  # [B, G, L]
-        rewards, successes = batch_shaped_evaluation_correctness_reward(
+        gen_rewards, eval_rewards, successes, gen_successes, eval_successes = batch_shaped_evaluation_correctness_reward(
             self._tokenizer, reward_responses, answers
         )  # [B, G]
-        rewards = rewards.to(self._device)
+        gen_rewards = gen_rewards.to(self._device)
+        eval_rewards = eval_rewards.to(self._device)
         successes = successes.to(self._device)
         
-        advantages = (rewards - rewards.mean(1, keepdim=True)) / (
-            rewards.std(1, keepdim=True) + 1e-4
+        gen_advantages = (gen_rewards - gen_rewards.mean(1, keepdim=True)) / (
+            gen_rewards.std(1, keepdim=True) + 1e-4
         )
-        advantages = advantages.reshape(batch_size * grpo_samples)  # flatten
-
+        eval_advantages = (eval_rewards - eval_rewards.mean(1, keepdim=True)) / (
+            eval_rewards.std(1, keepdim=True) + 1e-4
+        )
+        gen_advantages = gen_advantages.reshape(batch_size * grpo_samples)  # flatten
+        eval_advantages = eval_advantages.reshape(batch_size * grpo_samples)  # flatten
         del responses
+        del reward_responses
         torch.cuda.empty_cache()
         
         seq_lens = training.get_unmasked_sequence_lengths(response_padding_masks)
@@ -1024,13 +1029,13 @@ class SelfplayFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
         logprobs[response_padding_masks] = 1.0
         ref_logprobs[response_padding_masks] = 1.0
 
-        return GRPOTrajectory(
+        return context_length, gen_advantages, eval_advantages, gen_successes, eval_successes, GRPOTrajectory(
             query_responses=query_responses,
             logprobs=logprobs,
             ref_logprobs=ref_logprobs,
-            rewards=rewards.reshape(batch_size * grpo_samples),
+            rewards=eval_rewards.reshape(batch_size * grpo_samples),
             successes=successes.reshape(batch_size * grpo_samples),
-            advantages=advantages,
+            advantages=eval_advantages,
             masks=masks,
             position_ids=position_ids,
             response_padding_masks=response_padding_masks,
@@ -1077,16 +1082,15 @@ class SelfplayFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
                 )
                 
                 torch.cuda.empty_cache()
-                trajectories.append(
-                    self.evaluate_trajectory(
-                        batch_trajectory,
+                context_length, gen_advantages, eval_advantages, gen_successes, eval_successes, evaluated_trajectory = self.evaluate_trajectory(
+                    batch_trajectory,
                         batch_input_ids,
                         batch_answers,
-                        eval_prefix_ids
-                    )
+                    eval_prefix_ids
                 )
                 torch.cuda.empty_cache()
-        return GRPOTrajectory(*map(torch.cat, zip(*trajectories)))
+                trajectories.append(evaluated_trajectory)
+        return context_length, gen_advantages, eval_advantages, gen_successes, eval_successes, GRPOTrajectory(*map(torch.cat, zip(*trajectories)))
 
     def grpo_step(
         self,
@@ -1262,20 +1266,20 @@ class SelfplayFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
                     device=self._device,
                 )
                 
-                evaluated_trajectory = self.evaluate_trajectory_batched(
+                evaluated_context_length, gen_advantages, eval_advantages, gen_successes, eval_successes, evaluated_trajectory = self.evaluate_trajectory_batched(
                     trajectory,
                     tokens,
                     answers,
                     eval_prefix_ids= eval_prefix_ids
                 )
                 
-                evaluated_context_length = trajectory.query_responses.shape[1]
+                # evaluated_context_length = trajectory.query_responses.shape[1]
                 #print only on rank 0
                 if self._is_rank_zero:
                     print("evaluated_context_length", evaluated_context_length)
                     print("evaluated_trajectory.query_responses.shape", evaluated_trajectory.query_responses.shape)
                     print("evaluated_trajectory.query_responses", self._tokenizer.decode(evaluated_trajectory.query_responses[0].tolist()))
-                advantages = evaluated_trajectory.advantages
+                # advantages = evaluated_trajectory.advantages
                 
                 torch.distributed.barrier()
 
@@ -1283,7 +1287,7 @@ class SelfplayFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
                 for _ in range(self._ppo_epochs):
                     
                     # Selfplay step. Get the evalutor loss and stats first
-                    eval_step_stats = self.selfplay_grpo_step(evaluated_trajectory, evaluated_context_length, advantages)
+                    eval_step_stats = self.selfplay_grpo_step(evaluated_trajectory, evaluated_context_length, eval_advantages)
                     grpo_stats.append(eval_step_stats)
                     
                     eval_loss = eval_step_stats.loss
@@ -1301,10 +1305,10 @@ class SelfplayFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
                     torch.distributed.barrier()
                     
                     #GRPO step. Get the generator loss and stats
-                    grpo_step_stats = self.selfplay_grpo_step(trajectory, context_length, advantages)
+                    grpo_step_stats = self.selfplay_grpo_step(trajectory, context_length, gen_advantages)
                     grpo_loss = grpo_step_stats.loss
                     #Minimize the reward of the generator
-                    grpo_loss = -grpo_loss
+                    # grpo_loss = -grpo_loss
                     grpo_loss.backward()
                     
                     #Clip the gradients
@@ -1333,6 +1337,8 @@ class SelfplayFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
                     self.log_metrics(
                         evaluated_trajectory,
                         GRPOStats(*map(torch.stack, zip(*grpo_stats))),
+                        gen_successes=gen_successes,
+                        eval_successes=eval_successes,
                         **extra_metrics,
                     )
 
@@ -1378,7 +1384,7 @@ class SelfplayFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
         self.evaluator_rating += self.k_factor * (actual_evaluator - expected_evaluator)
 
     def log_metrics(
-        self, trajectory: GRPOTrajectory, grpo_stats: GRPOStats, **extras
+        self, trajectory: GRPOTrajectory, grpo_stats: GRPOStats, gen_successes: torch.Tensor, eval_successes: torch.Tensor, **extras
     ) -> None:
         """
         Log metrics and statistics for the current step to the metric logger.
@@ -1391,9 +1397,14 @@ class SelfplayFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
         torch.distributed.reduce(successes, dst=0, op=torch.distributed.ReduceOp.AVG)
 
         # Calculate wins/losses for Elo rating
-        generator_wins = (trajectory.rewards < 20).sum().item()  # Generator wins when evaluator is fooled
-        evaluator_wins = (trajectory.rewards > 20).sum().item()  # Evaluator wins when it catches incorrect answers
-        draws = (trajectory.rewards == 20).sum().item()  # Draws when both perform as expected
+        generator_wins = gen_successes.sum() # Generator wins when evaluator is fooled
+        # torch.distributed.reduce(generator_wins, dst=0, op=torch.distributed.ReduceOp.SUM)  # Use SUM instead of AVG since we want total wins
+        evaluator_wins = eval_successes.sum()  # Evaluator wins when it catches incorrect answers
+        # torch.distributed.reduce(evaluator_wins, dst=0, op=torch.distributed.ReduceOp.SUM)  # Use SUM instead of AVG since we want total wins
+        
+        total_games = trajectory.successes.numel()
+        # torch.distributed.reduce(total_games, dst=0, op=torch.distributed.ReduceOp.SUM)
+        draws = total_games - generator_wins - evaluator_wins  # Draws when both perform as expected
 
         # Update Elo ratings
         self.update_elo_ratings(generator_wins, evaluator_wins, draws)
