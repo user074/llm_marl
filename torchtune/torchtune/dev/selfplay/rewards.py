@@ -1,0 +1,162 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+from xml.etree import ElementTree as ET
+
+import torch
+
+from torchtune.modules.transforms.tokenizers import ModelTokenizer
+
+
+def extract_tags_eval(text: str) -> dict[str, list[str]]:
+    """
+    Parse XML-like tags from text. Returns a dictionary with keys 'think' and 'answer'.
+    The values are lists of strings, with each string being the content of a tag.
+    """
+    xml_string = f"<root>{text}</root>"
+    root = ET.fromstring(xml_string)
+
+    return {
+        "think": [
+            elem.text if elem.text is not None else "" for elem in root.findall("think")
+        ],
+        "answer": [
+            elem.text if elem.text is not None else ""
+            for elem in root.findall("answer")
+        ],
+        "evaluate": [
+            elem.text if elem.text is not None else ""
+            for elem in root.findall("evaluate")
+        ],
+        "verify": [
+            elem.text if elem.text is not None else ""
+            for elem in root.findall("verify")
+        ],
+    }
+
+
+def shaped_correctness_reward_eval(answer: str, completion: str) -> tuple[float, float]:
+    """
+    Reward function for verifiable rewards with some mild shaping.
+    In evaluation for selfplay, we want to reward the model for the following:
+    - Correct answer and wrong verification
+    - Incorrect answer and correct verification
+    
+
+    Args:
+        answer (str): ground-truth answer to the current problem
+        completion (str): model's completion, starting immediately after "Assistant: <think>"
+    Returns:
+        reward: (float) a shaped reward indicating the correct answer and the correct format
+        success: (float) a binary measure of success (1 if the answer is correct and correctly formatted, 0 otherwise)
+    """
+    eval_reward = 0.0
+    gen_reward = 0.0
+    success = 0.0
+    # print("completion", completion)
+    # print("answer", answer)
+    try:
+        tags = extract_tags_eval("<think>" + completion.replace("<<", "").replace(">>", ""))
+    except ET.ParseError:
+        tags = {"think": [], "answer": [], "evaluate": [], "verify": []}
+
+    # FORMAT REWARD: encourage proper formatting explicitly
+    # format_reward = 0.0
+    gen_reward += 5.0 if len(tags["answer"]) == 1 else 0.0
+    gen_reward += 5.0 if len(tags["think"]) == 1 else 0.0
+    eval_reward += 5.0 if len(tags["evaluate"]) == 3 else 0.0
+    eval_reward += 5.0 if len(tags["verify"]) == 3 else 0.0
+    # reward += format_reward
+    # evaluate_ans = ""
+    # verify_ans = ""
+    # if len(tags["evaluate"]) > 2:
+    #     evaluate_ans = tags["evaluate"][-1].strip()
+        
+    # if len(tags["evaluate"]) == 2 or evaluate_ans == "":
+    #     format_reward -= 20.0
+    # elif len(tags["evaluate"]) == 3:
+    #     format_reward += 5.0
+    
+    # if len(tags["verify"]) > 2:
+    #     verify_ans = tags["verify"][-1].strip()
+    
+    # if len(tags["verify"]) == 2 or verify_ans == "":
+    #     format_reward -= 20.0
+    # elif len(tags["verify"]) == 3:
+    #     format_reward += 5.0
+    
+    # PENALTY FOR EMPTY ANSWER AND THINK
+    if len(tags["answer"]) == 0 or tags["answer"][0].strip() == "":
+        format_reward -= 20.0  # explicit penalty for empty or missing answe
+    else:
+        format_reward += 5.0
+
+    if len(tags["think"]) == 0 or tags["think"][0].strip() == "":
+        format_reward -= 20.0  # explicit penalty for empty reasoning
+    else:
+        format_reward += min(5.0, len(tags["think"][0]) * 0.01) if len(tags["think"]) > 0 else 0.0
+    # format_reward += min(5.0, len(tags["answer"][0]) * 0.01) if len(tags["answer"]) > 0 else 0.0
+    
+    # PENALTY FOR Repeated Tokens in think
+    tokens = tags["think"][0].split() if len(tags["think"]) > 0 else []
+    if len(tokens) > 0:
+        unique_tokens = set(tokens)
+        diversity = len(unique_tokens) / (len(tokens) + 1e-5)
+        if diversity < 0.2:
+            format_reward -= 20.0 * (0.2 - diversity)
+    
+
+   # ADVERSARIAL REWARD (Stage 1 logic explicitly correct):
+    # Evaluator: +reward if catches incorrect answer
+    # Generator: -reward if successfully fools evaluator
+    
+    answer_correct = len(tags["answer"]) > 0 and tags["answer"][-1].strip() == answer.strip()
+    verification = tags["verify"][-1].lower() if len(tags["verify"]) > 2 else ""
+
+    if answer_correct and "wrong" == verification:
+        # Evaluator wrongly rejected correct answer (Evaluator fooled by Generator)
+        reward = 0.0
+        reward += format_reward
+    elif not answer_correct and "correct" == verification:
+        # Evaluator wrongly accepted incorrect answer (Evaluator fooled by Generator)
+        # reward -= 100.0
+        reward -= 100.0 # Set to 0 for 1st stage
+        reward += format_reward
+    elif not answer_correct and "wrong" == verification:
+        # Evaluator correctly rejected incorrect answer (Evaluator succeeded)
+        reward += 100.0
+        reward += format_reward
+    elif answer_correct and "correct" == verification:
+        # Evaluator correctly accepted correct answer (Evaluator succeeded)
+        reward += 50.0 # Set to 0 for 1st stage
+        reward += format_reward
+    if answer_correct:
+        success = 1.0  # explicitly successful scenario
+
+    return reward, success
+
+
+def batch_shaped_evaluation_correctness_reward(
+    tokenizer: ModelTokenizer, completions: torch.Tensor, answers: list[str]
+) -> [torch.Tensor, torch.Tensor]:
+    """Utility function to apply the shaped reward function to a GRPO-style batch of completions."""
+
+    batch_size, grpo_size, *_ = completions.shape
+    rewards = torch.zeros(batch_size, grpo_size, dtype=torch.float32)
+    successes = torch.zeros(batch_size, grpo_size, dtype=torch.float32)
+    # completions :: [B, G, L]
+    for b in range(batch_size):
+        for g in range(grpo_size):
+            text_completion = tokenizer.decode(
+                completions[b, g].tolist()
+            )  # skips special tokens, stops at eos
+            reward, success = shaped_correctness_reward_eval(
+                answer=answers[b], completion=text_completion
+            )
+            rewards[b, g] = reward
+            successes[b, g] = success
+
+    return rewards, successes
