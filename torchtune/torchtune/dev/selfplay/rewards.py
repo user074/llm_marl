@@ -9,6 +9,7 @@ from xml.etree import ElementTree as ET
 import torch
 
 from torchtune.modules.transforms.tokenizers import ModelTokenizer
+from torchtune.models.llama3 import Llama3Tokenizer
 
 
 def extract_tags_eval(text: str) -> dict[str, list[str]]:
@@ -58,6 +59,7 @@ def shaped_correctness_reward_eval(answer: str, completion: str) -> tuple[float,
     success = 0.0
     gen_success = 0.0
     eval_success = 0.0
+    both_success = 0.0
     # print("completion", completion)
     # print("answer", answer)
     try:
@@ -140,28 +142,37 @@ def shaped_correctness_reward_eval(answer: str, completion: str) -> tuple[float,
 
     #Separate rewards for generator and evaluator
     verification = tags["verify"][-1].lower() if len(tags["verify"]) > 2 else ""
-    if any(attempt == answer for attempt in tags["answer"]):
-        # One of the answer tags has the right answer
-        gen_reward += 20.0
-        if verification == "correct":
-            eval_reward += 20.0
+    #ensure the verification is in the right format
+    if verification == "correct" or verification == "wrong":
+        eval_reward += 10.0
+        
+    # if any(attempt == answer for attempt in tags["answer"]):
+    #     # One of the answer tags has the right answer
+    #     gen_reward += 20.0
+    #     if verification == "correct":
+    #         eval_reward += 20.0
 
-
-    if any((answer in attempt) for attempt in tags["answer"]):
-        # One of the answer tags contains the right answer (might be e.g. $20 instead of 20)
-        gen_reward += 20.0
-        if verification == "correct":
-            eval_reward += 20.0
+    # if any((answer in attempt) for attempt in tags["answer"]):
+    #     # One of the answer tags contains the right answer (might be e.g. $20 instead of 20)
+    #     gen_reward += 20.0
+    #     if verification == "correct":
+    #         eval_reward += 20.0
 
     if len(tags["answer"]) > 0 and tags["answer"][0] == answer:
         #Generator Correct Answer
         if verification == "correct":
             #Evaluator Correct Answer
-            gen_reward = 80.0
-            eval_reward = 80.0
+            gen_reward += 50.0
+            eval_reward += 50.0
+            both_success = 1.0
         elif verification == "wrong":
             #Generator Incorrect Answer
-            gen_reward = 100.0
+            gen_reward += 50.0
+            eval_reward -= 0.0
+            gen_success = 1.0
+        else:
+            #Evaluator Incorrect Format
+            gen_reward += 50.0
             eval_reward = 0.0
             gen_success = 1.0
         success = 1
@@ -170,14 +181,20 @@ def shaped_correctness_reward_eval(answer: str, completion: str) -> tuple[float,
         #Generator Incorrect Answer
         if verification == "correct":
             #Evaluator Correct Answer
-            pass
+            gen_reward += 50.0
+            eval_reward -= 0.0
         elif verification == "wrong":
             # gen_reward = 0.0
-            eval_reward = 100.0
+            gen_reward += 0.0
+            eval_reward += 50.0
             eval_success = 1.0
+        else:
+            #Evaluator Incorrect Format
+            eval_reward = 0.0
+            
         
     
-    return gen_reward, eval_reward, success, gen_success, eval_success
+    return gen_reward, eval_reward, success, gen_success, eval_success, both_success
 
 
 def batch_shaped_evaluation_correctness_reward(
@@ -191,16 +208,21 @@ def batch_shaped_evaluation_correctness_reward(
     successes = torch.zeros(batch_size, grpo_size, dtype=torch.float32)
     gen_successes = torch.zeros(batch_size, grpo_size, dtype=torch.float32)
     eval_successes = torch.zeros(batch_size, grpo_size, dtype=torch.float32)
+    both_successes = torch.zeros(batch_size, grpo_size, dtype=torch.float32)
     # completions :: [B, G, L]
     for b in range(batch_size):
         for g in range(grpo_size):
             # Replace invalid tokens with pad_id. Monkey patch for now.
             valid_tokens = completions[b, g].clone()
             # valid_tokens[valid_tokens >= tokenizer.vocab_size] = tokenizer.pad_id
-            valid_tokens[valid_tokens == 128011] = tokenizer.pad_id
-            
-            text_completion = tokenizer.decode(valid_tokens.tolist())
-            gen_reward, eval_reward, success, gen_success, eval_success = shaped_correctness_reward_eval(
+            #Check if it is llama3b tokenizer
+            if isinstance(tokenizer, Llama3Tokenizer):
+                valid_tokens[valid_tokens == 128011] = tokenizer.pad_id
+                text_completion = tokenizer.decode(valid_tokens.tolist())
+            else:
+                text_completion = tokenizer.decode(valid_tokens.tolist(), skip_special_tokens = True)
+            # print("text_completion", text_completion)
+            gen_reward, eval_reward, success, gen_success, eval_success, both_success = shaped_correctness_reward_eval(
                 answer=answers[b], completion=text_completion
             )
             gen_rewards[b, g] = gen_reward
@@ -208,5 +230,5 @@ def batch_shaped_evaluation_correctness_reward(
             successes[b, g] = success
             gen_successes[b, g] = gen_success
             eval_successes[b, g] = eval_success
-
-    return gen_rewards, eval_rewards, successes, gen_successes, eval_successes
+            both_successes[b, g] = both_success
+    return gen_rewards, eval_rewards, successes, gen_successes, eval_successes, both_successes
