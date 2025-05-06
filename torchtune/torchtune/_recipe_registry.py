@@ -24,6 +24,14 @@ class Recipe:
 
 _ALL_RECIPES = [
     Recipe(
+        name="dev/evaluator_full_finetune_distributed",
+        file_path="dev/evaluator_full_finetune_distributed.py",
+        configs=[
+            Config(name="dev/3B_full_grpo", file_path="dev/3B_full_grpo.yaml"),
+        ],
+        supports_distributed=True,
+    ),
+    Recipe(
         name="dev/selfplay_full_finetune_distributed",
         file_path="dev/selfplay_full_finetune_distributed.py",
         configs=[

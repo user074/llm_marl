@@ -22,7 +22,9 @@ from torchtune.config._utils import _get_component_from_path
 from torchtune.datasets import ConcatDataset
 from torchtune.dev.grpo.generation import generate
 from torchtune.dev.grpo.rewards import batch_shaped_correctness_reward
+from torchtune.dev.selfplay.rewards import batch_shaped_evaluation_correctness_reward
 from torchtune.dev.grpo.types import GRPOStats, GRPOTrajectory
+from torchtune.models.llama3 import Llama3Tokenizer
 from torchtune.modules import local_kv_cache
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import disable_dropout, DummyProfiler, PROFILER_KEY
@@ -32,7 +34,7 @@ from tqdm import tqdm
 log = utils.get_logger("DEBUG")
 
 
-class FullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
+class EvaluatorFullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
     """
     Full finetuning recipe for dense transformer-based LLMs such as Llama2, trained with GRPO. This recipe supports
     distributed training and can be run on a single node (1 to 8 GPUs).
@@ -136,6 +138,13 @@ class FullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
         self._total_steps = 0
         self._epochs_run = 0
         self._rng = torch.Generator(self._device).manual_seed(self.seed)
+        
+        self._evaluation_prefix = '''The Assistant evaluate the problem and the solution. The assistant first evaluates and find out where the solution is wrong. Then the assistant provides the verification. The evaluation process and verification are enclosed within <evaluate></evaluate> and <verify></verify> tags, respectively, i.e., <evaluate>evaluation process here</evaluate> <verify>verification here</verify>. Verification is limited to 'correct' or 'wrong'. Assistant:<evaluate>'''
+
+        # Elo rating attributes
+        self.generator_rating = 1500.0  # Initial Elo rating for generator
+        self.evaluator_rating = 1500.0  # Initial Elo rating for evaluator
+        self.k_factor = 32.0  # K-factor for Elo rating updates
 
     def load_checkpoint(self, cfg_checkpointer: DictConfig) -> Dict[str, Any]:
         """
@@ -283,6 +292,7 @@ class FullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
 
         # RL params
         self.grpo_samples = cfg.grpo_samples
+        self.evaluator_samples = cfg.evaluator_samples
         self._temperature = cfg.temperature
         self._top_k = cfg.top_k
         self._max_generated_tokens = cfg.max_generated_tokens
@@ -738,8 +748,6 @@ class FullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
                 stop_tokens=self._tokenizer.stop_tokens,
                 return_logits=False,
             )
-        if self._is_rank_zero:
-            print("query_responses", self._tokenizer.decode(query_responses[0].tolist(), skip_special_tokens=False, truncate_at_eos=False))
 
         torch.distributed.barrier()
         training._distributed.recursive_reshard(self._model)
@@ -747,8 +755,6 @@ class FullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
 
         responses = query_responses[:, context_length:].clone()
         query_response_padding_masks = query_responses != self._tokenizer.pad_id
-        if self._is_rank_zero:
-            print("query_response_padding_masks", query_response_padding_masks[0].tolist())
 
         # step 1.1 create attention masks and position IDs for any padding tokens in inputs, used for future forward passes
         masks = generation.get_causal_mask_from_padding_mask(
@@ -856,6 +862,268 @@ class FullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
                 )
                 torch.cuda.empty_cache()
         return GRPOTrajectory(*map(torch.cat, zip(*trajectories)))
+    
+    
+    # -------------------------------------------------------
+    # Evaluation of the generated trajectories
+    # -------------------------------------------------------
+    def evaluate_trajectory(
+        self,
+        trajectory_query_response: torch.Tensor,
+        input_ids: torch.Tensor,
+        answers: List[str],
+        eval_prefix_ids: torch.Tensor,
+    ) -> GRPOTrajectory:
+        """
+        Given the input_ids (containing an *old* system prompt + user question) and
+        a set of already-generated answers (`trajectory`), we create a new "evaluation"
+        trajectory. Concretely:
+
+        trajectory: GRPOTrajectory from the GRPO group sample from the batch
+        input_ids: system prompt + user question
+        answers: list of answers
+        evaluation_prefix: prefix to be added to the input_ids
+        
+        1. To simplify the process and have a quick experiment. We directly append the evaluation prefix to the responses from the GRPO group sample.
+        2. We then generate a new response from the current policy and compute the logprobs via the reference model.
+        3. We compute the rewards and successes for the new response.
+        4. We compute the advantages for the new response.
+        5. We return the new trajectory.
+
+        Returns:
+            A GRPOTrajectory whose structure matches `generate_trajectory`, so
+            that the same downstream logging and stats code can be used.
+        """
+        batch_size, question_length = input_ids.shape
+        grpo_samples = self.grpo_samples
+        evaluator_samples = self.evaluator_samples
+        # print("Shape after generation in evaluation:", trajectory.query_responses.shape)
+        # Tokenize the evaluation prefix just once:
+        # eval_prefix_ids = torch.tensor(
+        #     self._tokenizer.encode(evaluation_prefix, add_special_tokens=False),
+        #     device=self._device,
+        # )
+
+        # Extract responses from the GRPO group sample
+        responses_generated = trajectory_query_response # [B , L]
+        # context_length = responses_generated.shape[1]
+        # print("responses_generated before concat", responses_generated.shape)
+        # print("responses_generated before concat", self._tokenizer.decode(responses_generated[0].tolist()))
+
+        if isinstance(self._tokenizer, Llama3Tokenizer):
+            # Find the position of 128001 in each sequence
+            special_token = 128001
+        else:
+            special_token = 151643
+        # Create a mask for the special token
+        special_token_mask = responses_generated == special_token
+        # Find the first occurrence of the special token in each sequence
+        special_token_positions = torch.argmax(special_token_mask.int(), dim=1)
+        # If no special token is found, keep the full sequence
+        special_token_positions[~special_token_mask.any(dim=1)] = responses_generated.shape[1]
+        
+        # Create a list of truncated sequences with eval_prefix_ids concatenated
+        concatenated_responses = []
+        padding_id = self._tokenizer.pad_id
+        #Get the padding id which is the last token of responses_generated if it is not a special token
+        #Find one such padding id
+        for i, pos in enumerate(special_token_positions):
+            if pos+1 < responses_generated.shape[1]:
+                padding_id = responses_generated[i, pos+1]
+                break
+        
+        for i, pos in enumerate(special_token_positions):
+            truncated_seq = responses_generated[i, :pos]
+            concatenated_responses.append(torch.cat([truncated_seq, eval_prefix_ids]))
+        
+        # Stack the concatenated sequences
+        # Pad sequences to max length
+        max_len = max(len(seq) for seq in concatenated_responses)
+        padded_responses = [torch.nn.functional.pad(seq, (0, max_len - len(seq)), value=padding_id) for seq in concatenated_responses]
+        responses_generated = torch.stack(padded_responses)
+        context_length = responses_generated.shape[1]
+        
+        #Expand the responses_generated to batch_size * grpo_samples * grpo_samples from [batch_size * grpo_samples, seq_length] to [batch_size * grpo_samples, grpo_samples, seq_length]
+        # evaluator_samples = 2
+        responses_generated = responses_generated[:, None, :].expand(-1, evaluator_samples, -1)
+        responses_generated = responses_generated.reshape(batch_size * evaluator_samples, -1)
+        
+        # print("responses_generated after concat", responses_generated.shape)
+        # print("decoded responses_generated", self._tokenizer.decode(responses_generated[0].tolist()))
+
+        # No need to pad since generate function will pad to max_seq_len
+        # Proceed with your usual generation logic:
+        with local_kv_cache(
+            model=self._model,
+            batch_size=batch_size * evaluator_samples,
+            device=self._device,
+            dtype=self._dtype,
+            decoder_max_seq_len=context_length + 88 + self._max_generated_tokens,
+        ):
+            query_responses, _ = generate(
+                model=self._model,
+                prompt=responses_generated,
+                max_generated_tokens=self._max_generated_tokens,
+                temperature=self._temperature,
+                top_k=self._top_k,
+                pad_id=padding_id,
+                rng=self._rng,
+                stop_tokens=self._tokenizer.stop_tokens,
+                return_logits=False,
+            )
+        # print("query_responses shape", query_responses.shape)
+        # print("query_responses: ", self._tokenizer.decode(query_responses[0].tolist()))
+
+        torch.distributed.barrier()
+        training._distributed.recursive_reshard(self._model)
+        torch.cuda.empty_cache()
+
+        # step 1.1 create attention masks and position IDs for any padding tokens in inputs, used for future forward passes
+        query_response_padding_masks = query_responses != padding_id
+        masks = generation.get_causal_mask_from_padding_mask(query_response_padding_masks)
+        position_ids = generation.get_position_ids_from_padding_mask(query_response_padding_masks)
+        del query_response_padding_masks
+
+        # step 2. estimate logprobs of the responses using the current policy
+        logits = self._model(query_responses, input_pos=position_ids, mask=masks)
+        logits = logits[:, context_length - 1:]
+        responses = query_responses[:, context_length:].clone()
+        # print("responses: ", self._tokenizer.decode(responses[0].tolist(), truncate_at_eos = False, skip_special_tokens = False))
+        logprobs = rlhf.batched_logits_to_logprobs(logits, responses, self._temperature)
+        del logits
+        torch.cuda.empty_cache()
+        
+        # step 2.1 estimate logprobs of the responses using the reference policy
+        ref_logits = self._ref_model(query_responses, input_pos=position_ids, mask=masks)
+        ref_logits = rlhf.truncate_sequence_for_logprobs(ref_logits, context_length)
+        ref_logprobs = rlhf.batched_logits_to_logprobs(ref_logits, responses, self._temperature)
+
+        del ref_logits
+        torch.cuda.empty_cache()
+        
+        # step 4. replace any tokens in the responses after the first stop token (usually EOS token) with padding
+        # resulting in truncated responses
+        
+        (
+            response_padding_masks,
+            responses,
+        ) = rlhf.truncate_sequence_at_first_stop_token(  # [B x G, L]
+            responses, self._stop_token_ids, padding_id
+        )
+        
+        #Need to contruct the reward_responses from the query_responses
+        # Reward is calculated from question, response, eval_prefix, evaluation
+        reward_responses = query_responses[:, question_length:].clone()
+        (
+            reward_response_padding_masks,
+            reward_responses,
+        ) = rlhf.truncate_sequence_at_first_stop_token(  # [B x G, L]
+            reward_responses, self._stop_token_ids, padding_id
+        )
+        
+        # responses :: [B x G, L]
+        # responses = responses.reshape(batch_size, grpo_samples, -1)  # [B, G, L]
+        reward_responses = reward_responses.reshape(batch_size, evaluator_samples, -1)  # [B, G, L]
+        # print("reward_responses shape", reward_responses.shape)
+        # print("answers", answers)
+        # expanded_answers = []
+        # for answer in answers:
+        #     expanded_answers.extend([answer] * evaluator_samples)
+        # answers = expanded_answers * grpo_samples  # Repeat for each grpo_sample in the expansion
+        
+                    
+        gen_rewards, eval_rewards, successes, gen_successes, eval_successes, both_successes = batch_shaped_evaluation_correctness_reward(
+            self._tokenizer, reward_responses, answers
+        )  # [B, G]
+        gen_rewards = gen_rewards.to(self._device)
+        eval_rewards = eval_rewards.to(self._device)
+        successes = successes.to(self._device)
+        
+        gen_advantages = (gen_rewards - gen_rewards.mean(1, keepdim=True)) / (
+            gen_rewards.std(1, keepdim=True) + 1e-4
+        )
+        eval_advantages = (eval_rewards - eval_rewards.mean(1, keepdim=True)) / (
+            eval_rewards.std(1, keepdim=True) + 1e-4
+        )
+        
+        #We just need mean of gen_advantages with shape [B, G]
+        # gen_advantages = gen_advantages.reshape(batch_size * grpo_samples * grpo_samples)  # flatten
+        # gen_advantages = gen_advantages.reshape(batch_size, grpo_samples, evaluator_samples)
+        # gen_advantages = gen_advantages.mean(2)
+        gen_advantages = gen_advantages.reshape(batch_size * evaluator_samples)
+        eval_advantages = eval_advantages.reshape(batch_size * evaluator_samples)  # flatten
+        del responses
+        del reward_responses
+        torch.cuda.empty_cache()
+        
+        seq_lens = training.get_unmasked_sequence_lengths(response_padding_masks)
+        
+        # step 6. mask out all the invalid values in the trajectory due to padding tokens
+        logprobs[response_padding_masks] = 1.0
+        ref_logprobs[response_padding_masks] = 1.0
+
+        return context_length, gen_advantages, eval_advantages, gen_successes, eval_successes, both_successes, GRPOTrajectory(
+            query_responses=query_responses,
+            logprobs=logprobs,
+            ref_logprobs=ref_logprobs,
+            rewards=eval_rewards.reshape(batch_size * evaluator_samples),
+            successes=successes.reshape(batch_size * evaluator_samples),
+            advantages=eval_advantages,
+            masks=masks,
+            position_ids=position_ids,
+            response_padding_masks=response_padding_masks,
+            seq_lens=seq_lens,
+        )
+
+    def evaluate_trajectory_batched(
+        self,
+        trajectory: GRPOTrajectory,
+        input_ids: torch.Tensor,
+        answers: List[str],
+        eval_prefix_ids: torch.Tensor,
+    ) -> GRPOTrajectory:
+        """
+        Evaluates a batch of trajectories using `self._forward_batch_size` batch sizes.
+        See ``evaluate_trajectory`` for more details.
+
+        Args:
+            trajectory (GRPOTrajectory): The trajectory to evaluate
+            input_ids (torch.Tensor): tensor of input token IDs with shape [b, seq_length]
+            answers (List[str]): list of answers corresponding to the input_ids
+            eval_prefix_ids (torch.Tensor): tensor of evaluation prefix token IDs with shape [p]
+
+        Returns:
+            GRPOTrajectory: An instance of :class:`~torchtune.rlhf.GRPOTrajectory` comprising
+                the evaluated trajectory.
+        """
+        trajectories: List[GRPOTrajectory] = []
+        with torch.no_grad():
+            for batch_start in range(0, self.batch_size, self._forward_batch_size):
+                # Get the batch of input data
+                batch_input_ids = input_ids[
+                    batch_start : batch_start + self._forward_batch_size
+                ]
+                batch_answers = answers[
+                    batch_start : batch_start + self._forward_batch_size
+                ]
+                
+                # Get the corresponding slice of the trajectory
+                start_idx = batch_start * self.evaluator_samples
+                end_idx = (batch_start + self._forward_batch_size) * self.evaluator_samples
+                batch_trajectory = GRPOTrajectory(
+                    *[t[start_idx:end_idx] for t in trajectory]
+                )
+                
+                torch.cuda.empty_cache()
+                context_length, gen_advantages, eval_advantages, gen_successes, eval_successes, both_successes, evaluated_trajectory = self.evaluate_trajectory(
+                    batch_trajectory,
+                        batch_input_ids,
+                        batch_answers,
+                    eval_prefix_ids
+                )
+                torch.cuda.empty_cache()
+                trajectories.append(evaluated_trajectory)
+        return context_length, gen_advantages, eval_advantages, gen_successes, eval_successes, both_successes, GRPOTrajectory(*map(torch.cat, zip(*trajectories)))
 
     def grpo_step(
         self,
@@ -925,7 +1193,70 @@ class FullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
             clipfrac,
             approx_policy_kls,
         )
+        
+    def selfplay_grpo_step(
+        self,
+        trajectory: GRPOTrajectory,
+        context_length: int,
+        advantages: torch.Tensor,
+        is_generator: bool,
+    ) -> GRPOStats:
+        """
+        Perform a single selfplay optimization step over a batch of trajectories and corresponding advantages and returns. We can reference with the 
+        
 
+        """
+        # estimate logprobs from the policy at the current optimisation step
+
+        torch.cuda.empty_cache()
+
+        pi_logits = self._model(
+            trajectory.query_responses,
+            input_pos=trajectory.position_ids,
+            mask=trajectory.masks,
+        )
+
+        pi_logits = rlhf.truncate_sequence_for_logprobs(pi_logits, context_length)
+        pi_logprobs = rlhf.batched_logits_to_logprobs(
+            pi_logits,
+            trajectory.query_responses[:, context_length:],
+            self._temperature,
+            chunk_size=1,
+        )
+
+        pi_logprobs[trajectory.response_padding_masks] = 1.0
+
+        del pi_logits
+        torch.cuda.empty_cache()
+
+        if is_generator:
+            # calculate grpo loss
+            advantages = trajectory.advantages
+        loss, policy_loss, kl_loss, ratios, clipfrac = self._loss_fn(
+            trajectory.logprobs,
+            pi_logprobs,
+            trajectory.ref_logprobs,
+            advantages,
+            padding_masks=~trajectory.response_padding_masks,
+        )
+
+        torch.cuda.empty_cache()
+        
+        with torch.no_grad():
+            approx_policy_kls = (
+                0.5 * (pi_logprobs - trajectory.logprobs).pow(2)
+            ).mean()
+
+        return GRPOStats(
+            loss,
+            policy_loss,
+            kl_loss,
+            ratios,
+            clipfrac,
+            approx_policy_kls,
+        )
+        
+        
     def train(self) -> None:
         """
         The core training loop.
@@ -962,21 +1293,126 @@ class FullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
 
                 _, context_length = tokens.shape
 
-                trajectory = self.generate_trajectory_batched(tokens, answers)
-                torch.distributed.barrier()
+                # 1. Generate initial generator trajectories
+                generator_trajectory = self.generate_trajectory_batched(tokens, answers)
                 
-                #print only on rank 0
-                if self._is_rank_zero:
-                    print("trajectory.query_responses.shape", trajectory.query_responses.shape)
-                    print("trajectory.query_responses", self._tokenizer.decode(trajectory.query_responses[0].tolist()))
+                # 2. For each generator response, run evaluator rollouts
+                eval_prefix_ids = torch.tensor(
+                    self._tokenizer.encode(self._evaluation_prefix, add_bos=False, add_eos=False),
+                    device=self._device,
+                )
+                
+                # Lists to store all evaluator results
+                # all_eval_trajectories = []
+                # all_gen_advantages = []
+                # all_eval_advantages = []
+                # all_gen_successes = []
+                # all_eval_successes = []
+                # all_both_successes = []
+                # all_evaluated_context_length = []
+                
+                # Process each generator response separately
+                batch_size = tokens.shape[0]
+                # for i in range(batch_size * self.grpo_samples):
+                #     # Extract single response and create mini-batch
+                #     response = generator_trajectory.query_responses[i:i+1]  # Keep batch dimension
+                #     single_tokens = tokens[i // self.grpo_samples:i // self.grpo_samples + 1]
+                #     single_answers = [answers[i // self.grpo_samples]]
                     
+                #     # Run evaluator rollouts for this generator response
+                #     evaluated_context_length, gen_advs, eval_advs, gen_succ, eval_succ, both_succ, eval_traj = self.evaluate_trajectory(
+                #         response,
+                #         single_tokens,
+                #         single_answers,
+                #         eval_prefix_ids
+                #     )
+                    
+                
+                # Combine results
+                # gen_advantages = torch.cat(all_gen_advantages)
+                # eval_advantages = torch.cat(all_eval_advantages)
+                # gen_successes = torch.cat(all_gen_successes)
+                # eval_successes = torch.cat(all_eval_successes)
+                # both_successes = torch.cat(all_both_successes)
+                # evaluated_context_length = torch.cat(all_evaluated_context_length)
+                
+                # if self._is_rank_zero:
+                #     print("evaluated_context_length", evaluated_context_length)
+                #     print("evaluated_trajectory.query_responses.shape", eval_traj.
+                #     query_responses.shape)
+                #     print("evaluated_trajectory.query_responses", self._tokenizer.decode
+                #     (eval_traj.query_responses[0].tolist()))
+                    
+                torch.distributed.barrier()
+
+                # 3. Run PPO updates
                 grpo_stats: list[GRPOStats] = []
                 for _ in range(self._ppo_epochs):
-
-                    step_stats = self.grpo_step(trajectory, context_length)
-
-                    grpo_stats.append(step_stats)
-
+                    # Update evaluator using each evaluator trajectory
+                    gen_advs_list = []  # Create a list to store the advantages
+                    for i in range(batch_size * self.evaluator_samples):
+                        response = generator_trajectory.query_responses[i:i+1]  # Keep batch dimension
+                        single_tokens = tokens[i // self.evaluator_samples:i // self.evaluator_samples + 1]
+                        single_answers = [answers[i // self.evaluator_samples]]
+                        
+                        # Run evaluator rollouts for this generator response
+                        evaluated_context_length, gen_advs, eval_advs, gen_succ, eval_succ, both_succ, eval_traj = self.evaluate_trajectory(
+                            response,
+                            single_tokens,
+                            single_answers,
+                            eval_prefix_ids
+                        )
+                       
+                        eval_step_stats = self.selfplay_grpo_step(
+                            eval_traj,
+                            evaluated_context_length,
+                            eval_advs,
+                            is_generator=False
+                        )
+                        grpo_stats.append(eval_step_stats)
+                        
+                        # Reshape gen_advs to match the expected shape
+                        # gen_advs = gen_advs.reshape(-1)  # Flatten to 1D tensor
+                        # gen_advs_list.append(gen_advs)
+                        
+                        eval_loss = eval_step_stats.loss
+                        eval_loss.backward()  # No need to retain graph since we're stepping optimizer
+                        
+                        if self._clip_grad_norm is not None:
+                            grad_norm = torch.nn.utils.clip_grad_norm_(
+                                self._model.parameters(),
+                                max_norm=float(self._clip_grad_norm),
+                            )
+                        torch.distributed.barrier()
+                        self._optimizer.step()
+                        self._optimizer.zero_grad(set_to_none=True)
+                        torch.distributed.barrier()
+                        
+                        if self._is_rank_zero and i == 0:
+                            print("evaluated_context_length", evaluated_context_length)
+                            print("evaluated_trajectory.query_responses.shape", eval_traj.
+                            query_responses.shape)
+                            print("evaluated_trajectory.query_responses", self._tokenizer.decode
+                            (eval_traj.query_responses[0].tolist()))
+                        # Clean up tensors after each evaluator step
+                        del eval_loss, eval_step_stats, eval_traj
+                        torch.cuda.empty_cache()
+                    
+                    
+                    # Then update generator
+                    # gen_advs = torch.cat(gen_advs_list)  # Concatenate all generator advantages
+                    # Ensure the shape matches the trajectory
+                    # gen_advs = gen_advs.reshape(batch_size * self.grpo_samples)
+                    
+                    grpo_step_stats = self.selfplay_grpo_step(
+                        generator_trajectory,
+                        context_length,
+                        gen_advs,
+                        is_generator=True
+                    )
+                    grpo_loss = grpo_step_stats.loss
+                    grpo_loss.backward()
+                    
                     if self._clip_grad_norm is not None:
                         grad_norm = torch.nn.utils.clip_grad_norm_(
                             self._model.parameters(),
@@ -991,7 +1427,8 @@ class FullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
 
                     if self._lr_scheduler is not None:
                         self._lr_scheduler.step()
-
+                
+                # Log metrics using the last evaluator trajectory
                 self._steps_run += 1
                 if self._steps_run % self._log_every_n_steps == 0:
                     extra_metrics = {}
@@ -1000,12 +1437,19 @@ class FullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
                         extra_metrics["grad_norm"] = grad_norm
 
                     self.log_metrics(
-                        trajectory,
+                        generator_trajectory,  # Use last trajectory for logging
                         GRPOStats(*map(torch.stack, zip(*grpo_stats))),
+                        gen_successes=gen_succ,
+                        eval_successes=eval_succ,
+                        both_successes=both_succ,
                         **extra_metrics,
                     )
 
-                self.cleanup_after_step(trajectory, grpo_stats)
+                # Cleanup
+                # for eval_traj in all_eval_trajectories:
+                #     self.cleanup_after_step(eval_traj, grpo_stats)
+                self.cleanup_after_step(generator_trajectory, grpo_stats)
+                
                 pbar.update(1)
 
                 if self._steps_run == self._total_steps:
@@ -1020,17 +1464,57 @@ class FullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
 
         self._profiler.stop()
 
+    def update_elo_ratings(self, generator_wins: int, evaluator_wins: int, draws: int) -> None:
+        """
+        Update Elo ratings based on the outcome of a match between generator and evaluator.
+        
+        Args:
+            generator_wins (int): Number of times generator won
+            evaluator_wins (int): Number of times evaluator won
+            draws (int): Number of draws
+        """
+        total_games = generator_wins + evaluator_wins + draws
+        if total_games == 0:
+            return
+
+        # Calculate expected scores
+        expected_generator = 1 / (1 + 10 ** ((self.evaluator_rating - self.generator_rating) / 400))
+        expected_evaluator = 1 - expected_generator
+
+        # Calculate actual scores
+        actual_generator = (generator_wins + 0.5 * draws) / total_games
+        actual_evaluator = (evaluator_wins + 0.5 * draws) / total_games
+
+        # Update ratings
+        self.generator_rating += self.k_factor * (actual_generator - expected_generator)
+        self.evaluator_rating += self.k_factor * (actual_evaluator - expected_evaluator)
+
     def log_metrics(
-        self, trajectory: GRPOTrajectory, grpo_stats: GRPOStats, **extras
+        self, trajectory: GRPOTrajectory, grpo_stats: GRPOStats, gen_successes: torch.Tensor, eval_successes: torch.Tensor, both_successes: torch.Tensor, **extras
     ) -> None:
         """
         Log metrics and statistics for the current step to the metric logger.
         """
+        
         rewards = trajectory.rewards.mean()
         torch.distributed.reduce(rewards, dst=0, op=torch.distributed.ReduceOp.AVG)
 
         successes = trajectory.successes.mean()
         torch.distributed.reduce(successes, dst=0, op=torch.distributed.ReduceOp.AVG)
+
+        # Calculate wins/losses for Elo rating
+        generator_wins = gen_successes.sum() # Generator wins when evaluator is fooled
+        # torch.distributed.reduce(generator_wins, dst=0, op=torch.distributed.ReduceOp.SUM)  # Use SUM instead of AVG since we want total wins
+        evaluator_wins = eval_successes.sum()  # Evaluator wins when it catches incorrect answers
+        # torch.distributed.reduce(evaluator_wins, dst=0, op=torch.distributed.ReduceOp.SUM)  # Use SUM instead of AVG since we want total wins
+        both_wins = both_successes.sum()
+        # torch.distributed.reduce(both_wins, dst=0, op=torch.distributed.ReduceOp.SUM)
+        total_games = trajectory.successes.numel()
+        # torch.distributed.reduce(total_games, dst=0, op=torch.distributed.ReduceOp.SUM)
+        draws = total_games - generator_wins - evaluator_wins - both_wins  # Draws when both perform as expected
+
+        # Update Elo ratings
+        self.update_elo_ratings(generator_wins, evaluator_wins, draws)
 
         log_dict = {
             "rewards": rewards,
@@ -1043,6 +1527,12 @@ class FullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
             "ratios": grpo_stats.ratios.mean(),
             "approx_policy_kl": grpo_stats.approx_policy_kls.mean(),
             "response_lengths": trajectory.seq_lens.float().mean(),
+            "generator_elo": self.generator_rating,
+            "evaluator_elo": self.evaluator_rating,
+            "generator_wins": generator_wins,
+            "evaluator_wins": evaluator_wins,
+            "both_wins": both_wins,
+            "draws": draws,
             **extras,
         }
 
@@ -1081,8 +1571,8 @@ def recipe_main(cfg: DictConfig) -> None:
         - Overwritten by arguments from the command-line
     """
 
-    recipe = FullGRPOFinetuneRecipeDistributed(cfg=cfg)
-    config.log_config(recipe_name="FullGRPOFinetuneRecipeDistributed", cfg=cfg)
+    recipe = EvaluatorFullGRPOFinetuneRecipeDistributed(cfg=cfg)
+    config.log_config(recipe_name="EvaluatorFullGRPOFinetuneRecipeDistributed", cfg=cfg)
     recipe.setup(cfg=cfg)
     recipe.train()
     recipe.cleanup()

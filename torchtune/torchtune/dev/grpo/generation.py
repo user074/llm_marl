@@ -237,7 +237,11 @@ def generate(
 
     # mask out generated tokens in seqs that already hit a stop token
     if stop_tokens is not None:
-        generated_tokens *= stop_token_mask
+        # generated_tokens *= stop_token_mask
+        # Create a mask of where to apply padding
+        padding_needed = ~stop_token_mask.bool()
+        # Replace tokens with pad_id where padding is needed
+        generated_tokens = torch.where(padding_needed, pad_id, generated_tokens)
         if return_logits:
             generated_logits *= stop_token_mask[:, -generated_logits.shape[1] :, None]
 

@@ -16,7 +16,8 @@ from torchtune.modules.tokenizers import ModelTokenizer
 from torchtune.modules.transforms import Transform
 
 BASE_PROMPT = (
-    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
+    # "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
+    "A conversation between User and Assistant. The user provide a question and some proposed answers. The Assistant first thinks about the reasoning process in the mind and then provides correct answer. If the correct answer is not in the provided answers, the Assistant will provide the correct answer."
     "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
     "The reasoning process and answer are enclosed within <think></think> and <answer></answer> tags, respectively, "
     "i.e., <think>reasoning process here</think> <answer>answer here</answer>. User: %s. Assistant: <think>"

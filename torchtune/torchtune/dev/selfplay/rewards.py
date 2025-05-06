@@ -157,18 +157,19 @@ def shaped_correctness_reward_eval(answer: str, completion: str) -> tuple[float,
     #     gen_reward += 20.0
     #     if verification == "correct":
     #         eval_reward += 20.0
+    
 
     if len(tags["answer"]) > 0 and tags["answer"][0] == answer:
         #Generator Correct Answer
-        if verification == "correct":
+        if verification == "correct" or ('correct' in verification and 'wrong' not in verification):
             #Evaluator Correct Answer
-            gen_reward += 50.0
-            eval_reward += 50.0
+            gen_reward += 100.0
+            eval_reward += 100.0
             both_success = 1.0
-        elif verification == "wrong":
+        elif verification == "wrong" or ('wrong' in verification and 'correct' not in verification):
             #Generator Incorrect Answer
             gen_reward += 50.0
-            eval_reward -= 0.0
+            eval_reward = 0.0
             gen_success = 1.0
         else:
             #Evaluator Incorrect Format
@@ -176,23 +177,46 @@ def shaped_correctness_reward_eval(answer: str, completion: str) -> tuple[float,
             eval_reward = 0.0
             gen_success = 1.0
         success = 1
-    
-    if len(tags["answer"]) > 0 and tags["answer"][0] != answer:
-        #Generator Incorrect Answer
-        if verification == "correct":
+    elif len(tags["answer"]) > 0 and answer in tags["answer"][0]:
+        #Generator Correct Answer
+        #Generator Correct Answer
+        if verification == "correct" or ('correct' in verification and 'wrong' not in verification and 'incorrect' not in verification):
             #Evaluator Correct Answer
             gen_reward += 50.0
-            eval_reward -= 0.0
-        elif verification == "wrong":
+            eval_reward += 100.0
+            both_success = 1.0
+        elif verification == "wrong" or ('wrong' in verification and 'correct' not in verification):
+            #Generator Incorrect Answer
+            gen_reward += 20.0
+            eval_reward = 0.0
+            gen_success = 1.0
+        else:
+            #Evaluator Incorrect Format
+            gen_reward += 20.0
+            eval_reward = 0.0
+            gen_success = 1.0
+        success = 1
+    
+    elif len(tags["answer"]) > 0 and tags["answer"][0] != answer:
+        #Generator Incorrect Answer
+        #Might need to add if correct is in the verify or not
+        if verification == "correct" or ('correct' in verification and 'wrong' not in verification and 'incorrect' not in verification):
+            #Evaluator Correct Answer 
+            gen_reward += 0.0
+            eval_reward -= 100.0
+        elif verification == "wrong" or ('wrong' in verification and 'correct' not in verification):
             # gen_reward = 0.0
             gen_reward += 0.0
-            eval_reward += 50.0
+            eval_reward +=  100.0
             eval_success = 1.0
         else:
             #Evaluator Incorrect Format
-            eval_reward = 0.0
+            eval_reward -= 100.0
             
-        
+    #Evaluator just adversarial attack and create </answer> tag...
+    if len(tags["answer"]) == 0 or len(tags["think"]) == 0 or len(tags["evaluate"]) == 0 or len(tags["verify"]) == 0:
+        eval_reward = -100.0
+        gen_reward = -100.0
     
     return gen_reward, eval_reward, success, gen_success, eval_success, both_success
 
@@ -222,6 +246,7 @@ def batch_shaped_evaluation_correctness_reward(
             else:
                 text_completion = tokenizer.decode(valid_tokens.tolist(), skip_special_tokens = True)
             # print("text_completion", text_completion)
+            # print("answers", answers[b])
             gen_reward, eval_reward, success, gen_success, eval_success, both_success = shaped_correctness_reward_eval(
                 answer=answers[b], completion=text_completion
             )
